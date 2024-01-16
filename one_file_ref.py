@@ -132,18 +132,71 @@ class Attention(nn.Module):
         else:
             cur_pos = positions[-1].item() + 1
             key, value = repeat_kv(self.cache_k[:bsz, :cur_pos, ...], self.cache_v[:bsz, :cur_pos, ...], self.repeats)
-            
+
         query = xq.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
         # scores : [bsz, n_heads, seqlen | 1, seqlen]
         scores = torch.matmul(query, key.transpose(2, 3)) * self.scale
-        
+
         if mask is not None:
+            print("mask", mask, mask.shape)
             scores += mask[None, None, ...]
 
         scores = scores.float()
-        scores = nn.functional.softmax(scores, dim=-1).type_as(query)
+        scores_copy = scores.clone()
+        print("scores", scores.shape)
+        import math
+        def wild_activation(x):
+            if x < -4:
+                return 0
+            elif x < 0:
+                return 0.001
+            elif x < 1:
+                return x
+            else:
+                return math.pow(x, 2)
+
+        if mask is None:
+            values_per_row: int = scores.shape[-1]
+            test_scores_cpu = scores.cpu()
+            wild_out = test_scores_cpu.apply_(wild_activation)
+            wild_out: torch.Tensor = wild_out.to("cuda")
+            scores = (wild_out * (1 / values_per_row)).type_as(query)
+            sums = scores.sum(dim=-1)
+            sums = sums[..., None]
+            scores = (scores) / sums
+        else:
+            values_per_row: torch.Tensor = (mask == 0).sum(dim=-1, keepdim=False)
+            print("values_per_row", values_per_row.shape, values_per_row)
+            # multiply vector values_per_row with matrix scores
+            values_per_row = 1 / values_per_row
+            values_per_row = values_per_row[None, ...].T
+            test_scores_cpu = scores.cpu()
+            wild_out = test_scores_cpu.apply_(wild_activation)
+            wild_out: torch.Tensor = wild_out.to("cuda")
+            scores = (wild_out * values_per_row).type_as(query)
+            sums = scores.sum(dim=-1)
+            sums = sums[..., None]
+            scores = (scores) / sums
+        scores_softmax = nn.functional.softmax(scores_copy, dim=-1).type_as(query)
+
+        # write scores and scores_softmax to file
+        # create folder to save tensors
+        Path("scores").mkdir(parents=True, exist_ok=True)
+        import os
+        # check the highest number already existing
+        highest_number = 0
+        for file in os.listdir("scores"):
+            if file.endswith(".pt"):
+                number = int(file.split("_")[1].split(".")[0])
+                if number > highest_number:
+                    highest_number = number
+        highest_number += 1
+        torch.save(scores, f"scores/scores_{highest_number}.pt")
+        torch.save(scores_softmax, f"scores/scoressoftmax_{highest_number}.pt")
+        torch.save(scores_copy, f"scores/actualscores_{highest_number}.pt")
+
         output = torch.matmul(scores, value)  # (bs, n_local_heads, slen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
